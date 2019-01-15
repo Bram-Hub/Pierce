@@ -13,19 +13,21 @@
 #define SELBOUND 0.05
 
 bool gKeyboard[256];
-float cameraX, cameraY, cameraZ;
+float cameraX, cameraY, cameraZ, cameraVX, cameraVY;
 int screenWidth = 1024, screenHeight = 768;
 
 displaybuffer undoBuffer;
 std::list<graphTree*>::iterator displayItr;
 toolTip ttip;
-bool premiseMode = true, takeInTxt = false;
+bool premiseMode = true, takeInTxt = false, insertionMode = false;
 graphNode* nNode = 0;
 int mainWindow, tooltipWindow;
 char inputText[128];
 unsigned int inTxtPos;
 
 std::pair<selectObj*,graphNode*> alterObj;
+std::list<graphNode*> insertionCuts;
+std::list<graphNode*> insertionChildren;
 
 //Display functions
 void init();
@@ -52,6 +54,11 @@ void MousePassMove(int x, int y);
 
 //Support functions
 std::pair<float,float> getLoc(int x, int y);
+graphNode* colParent(graphNode* obj);
+int colChildren(graphNode* obj);
+int colSteal(graphNode* obj, graphNode* p1);
+void fail(int code);
+void abort(int code);
 
 void animate(int value);
 
@@ -62,7 +69,14 @@ void reset();
 //Inference functions
 bool verifyStep(std::string rule);
 bool verifyRec(std::string rule, std::list<graphNode*> used, std::list<std::pair<graphNode*,bool> >::iterator itr);
+bool verifyIteration();
+bool verifyInsertionC();
+bool verifyDCutAdd();
 void applyStep(std::string rule);
+
+bool insertInArea(graphNode* obj);
+bool insertIsArea(graphNode* obj);
+bool insertIsOld(graphNode* obj);
 
 bool contains(std::list<graphNode*> lst, graphNode* obj);
 
@@ -129,6 +143,8 @@ void init()
 	cameraX = 0;
 	cameraY = 0;
 	cameraZ = 15;
+	cameraVX = 0;
+	cameraVY = 0;
 	ttip.setText("Premise Drawing Mode.");
 	ttip.setColor(0.9,0.1,0.7);
 }
@@ -194,6 +210,10 @@ void Keyboard(unsigned char key, int x, int y)
 	gKeyboard[key] = true;
 	int mod = glutGetModifiers();
 
+	if (key == 'x' && mod == GLUT_ACTIVE_ALT) exit(0);
+	if (key == 'n' && mod == GLUT_ACTIVE_ALT) reset();
+	if (key == 'p' && mod == GLUT_ACTIVE_ALT) (*displayItr)->debugPrint();
+
 	if (takeInTxt)
 	{
 		if (inTxtPos >= 127)
@@ -218,7 +238,10 @@ void Keyboard(unsigned char key, int x, int y)
 			nNode = 0;
 			takeInTxt = false;
 			resetInput();
-			ttip.setText("Premise Drawing Mode.");
+			if (insertionMode)
+				ttip.setText("Insertion Mode.");
+			else
+				ttip.setText("Premise Drawing Mode.");
 			glutSetWindow(tooltipWindow);
 
 			(*displayItr)->debugPrint();
@@ -229,30 +252,54 @@ void Keyboard(unsigned char key, int x, int y)
 			delete nNode;
 			nNode = 0;
 			takeInTxt = false;
-			ttip.setText("Premise Drawing Mode.");
+			if (insertionMode)
+				ttip.setText("Insertion Mode.");
+			else
+				ttip.setText("Premise Drawing Mode.");
 			glutSetWindow(tooltipWindow);
 			glutPostRedisplay();
 		}
+		return;
 	}
-
-	if (key == 'x' && mod == GLUT_ACTIVE_ALT) exit(0);
-	if (key == 'n' && mod == GLUT_ACTIVE_ALT) reset();
-	if (key == 'p' && mod == GLUT_ACTIVE_ALT) (*displayItr)->debugPrint();
 
 	if (premiseMode)
 	{
 		if (key == 'r' && mod == GLUT_ACTIVE_ALT)
 		{
 			premiseMode = false;
+			if (insertionMode)
+			{
+				insertionMode = false;
+				insertionCuts.clear();
+				insertionChildren.clear();
+			}
 			ttip.setText("Inference Mode.");
+			ttip.setColor(0.3,0.7,0.9);
 			glutSetWindow(tooltipWindow);
 			glutPostRedisplay();
 		}
 		if (key == 127) //Delete
 		{
+			if (insertionMode)
+			{
+				std::list<std::pair<graphNode*,bool> >::iterator itr = (*displayItr)->selection.begin();
+				while (itr != (*displayItr)->selection.end())
+				{
+					if (insertInArea((*itr).first) == false || insertIsOld((*itr).first))
+					{
+						ttip.setText("Cannot delete existing objects when Inserting.");
+						ttip.setColor(1.0,0.0,0.0);
+						glutSetWindow(tooltipWindow);
+						glutPostRedisplay();
+						return;
+					}
+					itr++;
+				}
+			}
 			(*displayItr)->deleteSelections();
 			(*displayItr)->debugPrint();
 		}
+		return;
 	}
 	else
 	{
@@ -291,6 +338,14 @@ void Keyboard(unsigned char key, int x, int y)
 			{
 			}
 		}
+		if (key == 13) //Enter
+		{
+			if (verifyStep("Insertion"))
+			{
+				applyStep("Insertion");
+			}
+		}
+		return;
 	}
 }
 
@@ -298,335 +353,299 @@ void KeyboardSpec(int key, int x, int y)
 {
 }
 
+//Return the parent the object obj should have if the graph
+//is structured properly. NULL means that it would have
+//multiple parents, which means the location is invalid.
+graphNode* colParent(graphNode* obj)
+{
+	graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
+	if (obj->isCut)
+	{
+		graphNode* p2 = (*displayItr)->getLowestSubtree(obj->x2,obj->y2);
+		graphNode* p3 = (*displayItr)->getLowestSubtree(obj->x1,obj->y2);
+		graphNode* p4 = (*displayItr)->getLowestSubtree(obj->x2,obj->y1);
+		if (p1 != p2 || p1 != p3 || p1 != p4)
+			return (graphNode*)0;
+		//Cut object may think it is the new parent,
+		//but that just means it's still the old one.
+		else if (p1 == obj)
+			p1 = obj->parent;
+	}
+	return p1;
+}
+
+//Determine if there are children the object the object should no
+//longer have. Returns 0 if it isn't a cut or loses no children.
+//Returns 1 if it does, and 2 if one is partially contained.
+int colChildren(graphNode* obj)
+{
+	if (obj->isCut == false)
+		return 0;
+	std::list<graphNode*>::iterator cItr = obj->children.begin();
+	int ret = 0;
+	while (cItr != obj->children.end())
+	{
+		bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
+		if (!pn1)
+			ret = 1;
+		if ((*cItr)->isCut)
+		{
+			bool pn2 = obj->contains((*cItr)->x2,(*cItr)->y2);
+			bool pn3 = obj->contains((*cItr)->x1,(*cItr)->y2);
+			bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
+			if (pn1 != pn2 || pn1 != pn3 || pn1 != pn4)
+				return 2; //Object partially contains a child
+			if (obj->proxCol2((*cItr),SELBOUND))
+				return 2;
+		}
+		cItr++;
+	}
+	return ret;
+}
+
+//Determine if the object now contains new children that
+//formerly belonged to p1. Returns 0 if it isn't a cut 
+//or contains no new children. Returns 1 if it does, and
+//2 if something is partially contained.
+int colSteal(graphNode* obj, graphNode* p1)
+{
+	if (obj->isCut == false)
+		return 0;
+	std::list<graphNode*>::iterator cItr = p1->children.begin();
+	int ret = 0;
+	while (cItr != p1->children.end())
+	{
+		if (*cItr == obj)
+		{
+			cItr++;
+			continue;
+		}
+		if (obj->proxCol2((*cItr),SELBOUND))
+			return 2; //Partially contains a child
+		bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
+		if (pn1)
+			ret = 1;
+		if ((*cItr)->isCut)
+		{
+			bool pn2 = obj->contains((*cItr)->x2,(*cItr)->y2);
+			bool pn3 = obj->contains((*cItr)->x1,(*cItr)->y2);
+			bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
+			if (pn1 != pn2 || pn1 != pn3 || pn1 != pn4)
+				return 2; //Object partially contains a child
+		}
+		cItr++;
+	}
+	//if (obj->proxCol(p1,SELBOUND))
+	//	return 2;
+	return ret;
+}
+
+//A Copy, Move, or Resize operation failed.
+//Reset objects and provide an error message.
+void fail(int code)
+{
+	switch (code)
+	{
+	case 0:
+		break;
+	case 1:
+		ttip.setText("Not contained entirely by one subtree.");
+		break;
+	case 2:
+		ttip.setText("Object cannot be removed from current location.");
+		break;
+	case 3:
+		ttip.setText("Cut intersects current children.");
+		break;
+	case 4:
+		ttip.setText("Cut intersects new children.");
+		break;
+	case 5:
+		ttip.setText("Cannot modify old objects when Inserting.");
+		break;
+	case 6:
+		ttip.setText("Can only Insert into selected cuts.");
+		break;
+	default:
+		ttip.setText("Operation is invalid.");
+		break;
+	}
+	ttip.setColor(1.0,0.0,0.0);
+	graphNode* obj = alterObj.second;
+	selectObj* sObj = alterObj.first;
+	if (sObj->type == 3) //Copy operation
+		delete obj;
+	else if (sObj->type == 2) //Resize operation
+	{
+		if (abs(sObj->x - sObj->iX1) < SELBOUND)
+		{
+			obj->x1 = sObj->iX1;
+			if (abs(sObj->y - sObj->iY1) < SELBOUND)
+				obj->y1 = sObj->iY1;
+			else if (abs(sObj->y - sObj->iY2) < SELBOUND)
+				obj->y2 = sObj->iY2;
+		}
+		else if (abs(sObj->x - sObj->iX2) < SELBOUND)
+		{
+			obj->x2 = sObj->iX2;
+			if (abs(sObj->y - sObj->iY1) < SELBOUND)
+				obj->y1 = sObj->iY1;
+			else if (abs(sObj->y - sObj->iY2) < SELBOUND)
+				obj->y2 = sObj->iY2;
+		}
+		else if (abs(sObj->y - sObj->iY1) < SELBOUND)
+			obj->y1 = sObj->iY1;
+		else if (abs(sObj->y - sObj->iY2) < SELBOUND)
+			obj->y2 = sObj->iY2;
+	}
+	else if (sObj->subtree)
+		obj->moveAll(sObj->iX1,sObj->iY1);
+	else
+		obj->move(sObj->iX1,sObj->iY1);
+	sObj->set(0,0,0,0,0,0,0);
+	alterObj.second = 0;
+	return;
+}
+
+void abort(int code)
+{
+	switch (code)
+	{
+	case 0:
+		break;
+	case 1:
+		ttip.setText("Not contained entirely by one subtree.");
+		break;
+	case 2:
+		ttip.setText("Cut is too small.");
+		break;
+	case 3:
+		ttip.setText("Cut does not fully contain new children.");
+		break;
+	case 4:
+		ttip.setText("Cut intersects new children.");
+		break;
+	case 5:
+		ttip.setText("Cannot modify old children when Inserting.");
+		break;
+	case 6:
+		ttip.setText("May only Insert into selected cuts.");
+		break;
+	default:
+		ttip.setText("Operation is invalid.");
+		break;
+	}
+	ttip.setColor(1.0,0.0,0.0);
+	glutSetWindow(tooltipWindow);
+	glutPostRedisplay();
+	delete nNode;	//Too small of a cut. Abort.
+	nNode = 0;
+	return;
+}
+
 //Mouse button is pressed or released
-//This function is so horribly written as things got
-//tacked on whereever as functionality was added.
-//I'm sorry :(
 void Mouse(int button, int state, int x, int y)
 {
 	int mod = glutGetModifiers();
 
-	if (state == GLUT_UP && button == GLUT_LEFT_BUTTON && alterObj.second != 0)
+	if (state == GLUT_UP && button == GLUT_LEFT_BUTTON)
 	{
-		std::cout << "Ending alteration operation.\n";
-		if (premiseMode == false && alterObj.first->type == 3)
+		//Copy, Move, or Resize operation
+		if (alterObj.second != 0)
 		{
-			//Copying an object in Inference Mode can only
-			//be done with Iteration (to the same subtree)
-			//or Insertion (to an odd level anywhere).
-			if (verifyStep("Iteration"))
-				applyStep("Iteration");
-			else if (verifyStep("InsertionC"))
-				applyStep("InsertionC");
-			else
-				delete alterObj.second;
-			alterObj.second = 0;
-			alterObj.first->set(0,0,0,0,0,0,0);
-			return;
-		}
-		//Finished a move, resize, or copy operation. Check for consistency.
-		graphNode* obj = alterObj.second;
-		selectObj* sObj = alterObj.first;
-		if (obj->isCut)
-		{
-			//Boundary checking
-			graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
-			graphNode* p2 = (*displayItr)->getLowestSubtree(obj->x2,obj->y2);
-			graphNode* p3 = (*displayItr)->getLowestSubtree(obj->x1,obj->y2);
-			graphNode* p4 = (*displayItr)->getLowestSubtree(obj->x2,obj->y1);
-			if (p1 != p2 || p1 != p3 || p1 != p4)
+			graphNode* obj = alterObj.second;
+			selectObj* sObj = alterObj.first;
+			int type = alterObj.first->type;
+			graphNode* parent = colParent(obj);
+			if (parent == 0)
 			{
-				ttip.setText("Not contained entirely by one subtree.");
-				ttip.setColor(1.0,0.0,0.0);
-				if (sObj->type == 3) //Copy operation
-					delete obj;
-				else if (sObj->type == 2) //Resize operation
-				{
-					if (abs(sObj->x - sObj->iX1) < SELBOUND)
-					{
-						obj->x1 = sObj->iX1;
-						if (abs(sObj->y - sObj->iY1) < SELBOUND)
-							obj->y1 = sObj->iY1;
-						else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-							obj->y2 = sObj->iY2;
-					}
-					else if (abs(sObj->x - sObj->iX2) < SELBOUND)
-					{
-						obj->x2 = sObj->iX2;
-						if (abs(sObj->y - sObj->iY1) < SELBOUND)
-							obj->y1 = sObj->iY1;
-						else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-							obj->y2 = sObj->iY2;
-					}
-					else if (abs(sObj->y - sObj->iY1) < SELBOUND)
-						obj->y1 = sObj->iY1;
-					else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-						obj->y2 = sObj->iY2;
-				}
-				else if (sObj->subtree)
-					obj->moveAll(sObj->iX1,sObj->iY1);
-				else
-					obj->move(sObj->iX1,sObj->iY1);
-				sObj->set(0,0,0,0,0,0,0);
-				alterObj.second = 0;
+				fail(1);
 				return;
 			}
-			if (p1 == obj)
+			bool newParent = parent != obj->parent;
+			if (premiseMode == false)
 			{
-				//Cut object think itself is its new parent.
-				//Really it just has the same parent as before.
-				p1 = obj->parent;
-			}
-			if (obj->proxCol(p1,SELBOUND))
-			{
-				//Too close to something else. Fail.
-				ttip.setText("Cut or contained object is too close to another object.");
-				ttip.setColor(1.0,0.0,0.0);
-				if (sObj->type == 3)
-					delete obj;
-				else if (sObj->type == 2) //Resize operation
+				//Copy or Move
+				std::string inf = "none";
+				if (type == 3 || (type == 1 && newParent))
 				{
-					if (abs(sObj->x - sObj->iX1) < SELBOUND)
-					{
-						obj->x1 = sObj->iX1;
-						if (abs(sObj->y - sObj->iY1) < SELBOUND)
-							obj->y1 = sObj->iY1;
-						else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-							obj->y2 = sObj->iY2;
-					}
-					else if (abs(sObj->x - sObj->iX2) < SELBOUND)
-					{
-						obj->x2 = sObj->iX2;
-						if (abs(sObj->y - sObj->iY1) < SELBOUND)
-							obj->y1 = sObj->iY1;
-						else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-							obj->y2 = sObj->iY2;
-					}
-					else if (abs(sObj->y - sObj->iY1) < SELBOUND)
-						obj->y1 = sObj->iY1;
-					else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-						obj->y2 = sObj->iY2;
-				}
-				else if (sObj->subtree)
-					obj->moveAll(sObj->iX1,sObj->iY1);
-				else
-					obj->move(sObj->iX1,sObj->iY1);
-				sObj->set(0,0,0,0,0,0,0);
-				alterObj.second = 0;
-				return;
-			}
-			//Check to see if obj no longer contains some child.
-			//We'll actually deal with this later (need to make
-			//sure the operation is completely valid before
-			//doing any alterations).
-			bool loseChildren = false;
-			std::list<graphNode*>::iterator cItr = obj->children.begin();
-			while (cItr != obj->children.end())
-			{
-				if ((*cItr)->isCut)
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					bool pn2 = obj->contains((*cItr)->x2,(*cItr)->y2);
-					bool pn3 = obj->contains((*cItr)->x1,(*cItr)->y2);
-					bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
-					if (pn1 != pn2 || pn1 != pn3 || pn1 != pn4)
-					{
-						ttip.setText("A child would be partially contained by different subtrees.");
-						ttip.setColor(1.0,0.0,0.0);
-						if (sObj->type == 3)
-							delete obj;
-						else if (sObj->type == 2) //Resize operation
-						{
-							if (abs(sObj->x - sObj->iX1) < SELBOUND)
-							{
-								obj->x1 = sObj->iX1;
-								if (abs(sObj->y - sObj->iY1) < SELBOUND)
-									obj->y1 = sObj->iY1;
-								else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-									obj->y2 = sObj->iY2;
-							}
-							else if (abs(sObj->x - sObj->iX2) < SELBOUND)
-							{
-								obj->x2 = sObj->iX2;
-								if (abs(sObj->y - sObj->iY1) < SELBOUND)
-									obj->y1 = sObj->iY1;
-								else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-									obj->y2 = sObj->iY2;
-							}
-							else if (abs(sObj->y - sObj->iY1) < SELBOUND)
-								obj->y1 = sObj->iY1;
-							else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-								obj->y2 = sObj->iY2;
-						}
-						else if (sObj->subtree)
-							obj->moveAll(sObj->iX1,sObj->iY1);
-						else
-							obj->move(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-					if (!pn1 && !premiseMode)
-					{
-						ttip.setText("All children must remain inside this cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						obj->moveAll(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-					else if (!pn1)
-					{
-						loseChildren = true;
-						cItr++;
-						continue;
-					}
-				}
-				else
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					if (!pn1 && !premiseMode)
-					{
-						ttip.setText("All children must remain inside this cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						obj->moveAll(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-					else if (!pn1)
-					{
-						loseChildren = true;
-						cItr++;
-						continue;
-					}
-				}
-				cItr++;
-			}
-
-			//Check to see if obj now has a new parent.
-			//If so, change the parent (and parent's children).
-			bool changeParent = false;
-			std::string inf = "none";
-			if (p1 != obj->parent)
-			{
-				if (!premiseMode)
-				{
-					//Can assume it's a move operation.
-					//Copying in InfMode is handled above, and 
-					//a resize can't cause this.
 					if (verifyStep("Iteration"))
 						inf = "Iteration";
-					else if (verifyStep("InsertionC"))
+					else if(verifyStep("InsertionC"))
 						inf = "InsertionC";
-					if (inf.compare("none") == 0)
+					else
 					{
-						obj->moveAll(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
+						fail(0);
 						return;
 					}
 				}
-				else
-					changeParent = true;
-			}
-			//Check to see if obj now contains new objects.
-			//If so, and not in premise mode, fail.
-			bool kidnap = false;
-			cItr = p1->children.begin(); //Current parent is p1 whether it was before or not.
-			while (cItr != p1->children.end())
-			{
-				if ((*cItr) == obj)
-				{
-					cItr++;
-					continue;
-				}
-				if ((*cItr)->isCut)
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					bool pn2 = obj->contains((*cItr)->x1,(*cItr)->y2);
-					bool pn3 = obj->contains((*cItr)->x2,(*cItr)->y2);
-					bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
-					if (pn1 && pn2 && pn3 && pn4)
-					{
-						if (!premiseMode)
-						{
-							ttip.setText("Cut cannot steal existing children.");
-							ttip.setColor(1.0,0.0,0.0);
-							obj->moveAll(sObj->iX1,sObj->iY1);
-							sObj->set(0,0,0,0,0,0,0);
-							alterObj.second = 0;
-							return;
-						}
-						else
-							kidnap = true;
-					}
-					else if (pn1 || pn2 || pn3 || pn4)
-					{
-						ttip.setText("Cut would partially contain another cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						if (sObj->type == 3)
-							delete obj;
-						else if (sObj->type == 2) //Resize operation
-						{
-							if (abs(sObj->x - sObj->iX1) < SELBOUND)
-							{
-								obj->x1 = sObj->iX1;
-								if (abs(sObj->y - sObj->iY1) < SELBOUND)
-									obj->y1 = sObj->iY1;
-								else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-									obj->y2 = sObj->iY2;
-							}
-							else if (abs(sObj->x - sObj->iX2) < SELBOUND)
-							{
-								obj->x2 = sObj->iX2;
-								if (abs(sObj->y - sObj->iY1) < SELBOUND)
-									obj->y1 = sObj->iY1;
-								else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-									obj->y2 = sObj->iY2;
-							}
-							else if (abs(sObj->y - sObj->iY1) < SELBOUND)
-								obj->y1 = sObj->iY1;
-							else if (abs(sObj->y - sObj->iY2) < SELBOUND)
-								obj->y2 = sObj->iY2;
-						}
-						else if (sObj->subtree)
-							obj->moveAll(sObj->iX1,sObj->iY1);
-						else
-							obj->move(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-				}
-				else
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					if (pn1)
-					{
-						if (!premiseMode)
-						{
-							ttip.setText("Cut cannot steal existing children.");
-							ttip.setColor(1.0,0.0,0.0);
-							obj->moveAll(sObj->iX1,sObj->iY1);
-							sObj->set(0,0,0,0,0,0,0);
-							alterObj.second = 0;
-							return;
-						}
-						else
-							kidnap = true;
-					}
-				}
-				cItr++;
-			}
 
-			//Now that the operation is known to be valid,
-			//actually perform the operation.
-			if (premiseMode)
-			{
-				if (loseChildren)
+				if (type == 1 && newParent)
 				{
-					cItr = obj->children.begin();
+					//Adding these is valid. Check to see if the
+					//old ones can be removed.
+					if (obj->getDepth() % 2 == 0 || obj->duplicates(obj) != 0)
+					{
+						applyStep(inf);
+						sObj->set(0,0,0,0,0,0,0);
+						alterObj.second = 0;
+					}
+					else
+						fail(2);
+				}
+				else if (type == 3)
+				{
+					applyStep(inf);
+					sObj->set(0,0,0,0,0,0,0);
+					alterObj.second = 0;
+				}
+				return;
+			}
+			else
+			{
+				int childChange = colChildren(obj);
+				if (childChange == 2)
+				{
+					fail(3);
+					return;
+				}
+				int childSteal = colSteal(obj, parent);
+				if (childSteal == 2)
+					fail(4);
+				if (insertionMode && (childChange == 1 || childSteal == 1 || newParent))
+				{
+					/* Insertion mode stuff
+					   The structure of the graph has changed, so run additional checks:
+						Check that the altered object is not an old object
+						Check that parent is either a selected cut or not an old object
+						Check that nothing being 'stolen' is an old object
+					*/
+					if (insertInArea(parent) == false || 
+						(insertIsArea(parent) == false && insertIsOld(parent)))
+					{
+						fail(6);
+						return;
+					}
+					else if (insertIsOld(obj) || insertInArea(obj) == false)
+					{
+						fail(5);
+						return;
+					}
+					std::list<graphNode*>::iterator cItr = parent->children.begin();
+					while (cItr != parent->children.end())
+					{
+						bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
+						if (insertIsOld((*cItr)) && pn1)
+						{
+							fail(5);
+							return;
+						}
+						cItr++;
+					}
+				}
+				if (childChange == 1)
+				{
+					std::list<graphNode*>::iterator cItr = obj->children.begin();
 					graphNode* dChild;
 					while (cItr != obj->children.end())
 					{
@@ -644,300 +663,152 @@ void Mouse(int button, int state, int x, int y)
 							cItr++;
 					}
 				}
-				if (kidnap)
-					obj->stealChildren(p1); //We've already checked for the failure cases.
-				//std::cout << changeParent << " " << sObj->type << "\n";
-				if (changeParent)
+				if (childSteal == 1)
 				{
-					obj->parent->children.remove(obj);
-					if (kidnap)
-						(*displayItr)->insert(p1,obj);
-					else
-						(*displayItr)->add(p1,obj);
-				}
-				else if (kidnap && (sObj->type == 1 || sObj->type == 2))
-				{
+					obj->stealChildren(parent); //We've already checked for the failure cases.
+
 					//Remove any children stolen by this object from former parent.
-					cItr = obj->children.begin();
+					std::list<graphNode*>::iterator cItr = obj->children.begin();
 					while (cItr != obj->children.end())
 					{
 						obj->parent->children.remove((*cItr));
 						cItr++;
 					}
 				}
-				else if (sObj->type == 3) //Copied object only thinks it has the right parent
+				if (newParent && type == 1)
 				{
-					if (kidnap)
-						(*displayItr)->insert(p1,obj);
-					else
-						(*displayItr)->add(p1,obj);
+					obj->parent->children.remove(obj);
+					(*displayItr)->add(parent,obj);
+				}
+				else if (type == 3) //Copied object only thinks it has the right parent
+				{
+					(*displayItr)->add(parent,obj);
 					obj->setColor(0.0,0.0,0.0);
 				}
 				sObj->set(0,0,0,0,0,0,0);
 				alterObj.second = 0;
 			}
-			else
-			{
-				if (inf.compare("none") != 0)
-				{
-					//Adding these is valid. Check to see if the
-					//old ones can be removed.
-					if (obj->getDepth() % 2 == 0 || obj->duplicates(obj) != 0)
-					{
-						applyStep(inf);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-					else
-					{
-						//Can't be removed. Fail.
-						obj->moveAll(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-				}
-				//Else case was already handled.
-			}
 		}
-		else
+		else if (premiseMode == true && nNode != 0)
 		{
-			graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
-			if (obj->proxCol(p1,SELBOUND))
+			std::pair<float,float> mLoc = getLoc(x,y);
+			if (abs(mLoc.first - nNode->x1) > 0.15 || abs(mLoc.second - nNode->y1) > 0.15)
 			{
-				//Too close to something else. Fail.
-				ttip.setText("Object is too close to another object.");
-				ttip.setColor(1.0,0.0,0.0);
-				if (sObj->type == 3)
-					delete obj;
-				else
-					obj->moveAll(sObj->iX1,sObj->iY1);
-				sObj->set(0,0,0,0,0,0,0);
-				alterObj.second = 0;
+				delete nNode;
+				nNode = 0;
 				return;
 			}
-			if (p1 != obj->parent) //New parent
+			graphNode* p1 = (*displayItr)->getLowestSubtree(nNode->x1, nNode->y1);
+			if (nNode->proxCol(p1,SELBOUND))
 			{
-				if (premiseMode)
-				{
-					if (sObj->type == 1)
-						obj->parent->children.remove(obj);
-					obj->parent = p1;
-					p1->addChild(obj);
-				}
-				else
-				{
-					std::string inf = "none";
-					if (verifyStep("Iteration"))
-						inf = "Iteration";
-					else if (verifyStep("Insertion"))
-						inf = "Insertion";
-					if (inf.compare("none") != 0)
-					{
-						//Adding these is valid. Check to see if the
-						//old ones can be removed.
-						if (obj->getDepth() % 2 == 0 || obj->duplicates(obj) != 0)
-						{
-							applyStep(inf);
-							sObj->set(0,0,0,0,0,0,0);
-							alterObj.second = 0;
-							return;
-						}
-						else
-						{
-							//Can't be removed. Fail.
-							ttip.setText("Unable to remove object from old location.");
-							ttip.setColor(1.0,0.0,0.0);
-							obj->moveAll(sObj->iX1,sObj->iY1);
-							sObj->set(0,0,0,0,0,0,0);
-							alterObj.second = 0;
-							return;
-						}
-					}
-					else
-					{
-						//Can't be moved there. Fail.
-						obj->moveAll(sObj->iX1,sObj->iY1);
-						sObj->set(0,0,0,0,0,0,0);
-						alterObj.second = 0;
-						return;
-					}
-				}
-			}
-			else if (sObj->type == 3)
-			{
-				//Same parent in a premiseMode copy.
-				//The object thinks it has the right parent, but
-				//no one else knows about it.
-				obj->parent->addChild(obj);
-				obj->setColor(0.0,0.0,0.0);
-			}
-			//Does not have a new parent.
-			//Moved or copied with no collisions
-			//and no adjustments needed.
-			//Just leave it there.
-			sObj->set(0,0,0,0,0,0,0);
-			alterObj.second = 0;
-		}
-		sObj->set(0,0,0,0,0,0,0);
-		sObj->original = 0;
-		alterObj.second = 0;
-		if (premiseMode)
-			ttip.setText("Premise Drawing Mode.");
-		ttip.setColor(0.9,0.1,0.7);
-		return;
-	}
-
-	if (!premiseMode && nNode != 0 && button == GLUT_RIGHT_BUTTON && state == GLUT_UP)
-	{
-		//Button release for a doublecut add.
-		if (verifyStep("DoubleCutAdd"))
-			applyStep("DoubleCutAdd");
-		else
-			delete nNode;
-		nNode = 0;
-	}
-
-	if (premiseMode == true)
-	{
-		if (state == GLUT_UP) //Button release
-		{
-			if (button == GLUT_RIGHT_BUTTON && nNode != 0)
-			{
-				if (abs(nNode->x1 - nNode->x2) < 0.2 || abs(nNode->y1 - nNode->y2) < 0.2)
-				{
-					ttip.setText("Cut is too small.");
-					glutSetWindow(tooltipWindow);
-					glutPostRedisplay();
-					delete nNode;	//Too small of a cut. Abort.
-				}
-
-				//Boundary checking
-				graphNode* p1 = (*displayItr)->getLowestSubtree(nNode->x1,nNode->y1);
-				graphNode* p2 = (*displayItr)->getLowestSubtree(nNode->x2,nNode->y2);
-				graphNode* p3 = (*displayItr)->getLowestSubtree(nNode->x1,nNode->y2);
-				graphNode* p4 = (*displayItr)->getLowestSubtree(nNode->x2,nNode->y1);
-
-				if (p1 != p2 || p1 != p3 || p1 != p4)
-				{
-					ttip.setText("Cut is not contained entirely by one subtree.");
-					glutSetWindow(tooltipWindow);
-					glutPostRedisplay();
-					delete nNode;	//Abort
-				}
-				else
-				{
-					if (nNode->stealChildren(p1))
-					{
-						nNode->setColor(0.0,0.0,0.0);
-						(*displayItr)->insert(p1,nNode);
-					}
-					else
-					{
-						ttip.setText("Cut partially contains another subtree.");
-						glutSetWindow(tooltipWindow);
-						glutPostRedisplay();
-						delete nNode;
-					}
-				}
+				delete nNode;
 				nNode = 0;
+				return;
 			}
-			else if (button == GLUT_LEFT_BUTTON && nNode != 0)
+			else if (insertionMode)
 			{
-				std::pair<float,float> mLoc = getLoc(x,y);
-				if (abs(mLoc.first - nNode->x1) > 0.15 || abs(mLoc.second - nNode->y1) > 0.15)
+				if (insertInArea(p1) == false || 
+					(insertIsArea(p1) == false && insertIsOld(p1)))
 				{
 					delete nNode;
 					nNode = 0;
 					return;
 				}
-				takeInTxt = true;
-				ttip.setText("Enter object label.");
-				glutSetWindow(tooltipWindow);
-				glutPostRedisplay();
 			}
+			takeInTxt = true;
+			ttip.setText("Enter object label:");
+			if (insertionMode)
+				ttip.setColor(0.3,0.7,0.9);
+			else
+				ttip.setColor(0.9,0.1,0.7);
+			glutSetWindow(tooltipWindow);
+			glutPostRedisplay();
 		}
-		else
+		return;
+	}
+
+	else if (state == GLUT_UP && button == GLUT_RIGHT_BUTTON)
+	{
+		if (premiseMode == false && nNode != 0)
 		{
-			if (button == GLUT_RIGHT_BUTTON) //Right-click
+			if (verifyStep("DoubleCutAdd"))
+				applyStep("DoubleCutAdd");
+			else
+				delete nNode;
+			nNode = 0;
+		}
+		else if (premiseMode)
+		{
+			if (nNode != 0)
 			{
-				std::pair<float,float> mLoc = getLoc(x,y);
-				graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);				
-				if (sPick == (*displayItr)->root)
+				if (abs(nNode->x1 - nNode->x2) < 0.2 || abs(nNode->y1 - nNode->y2) < 0.2)
 				{
-					nNode = new graphNode();
-					nNode->isCut = true;
-					nNode->setColor(0.5,0.5,0.5);
-					nNode->x1 = mLoc.first;
-					nNode->y1 = mLoc.second;
-					nNode->x2 = mLoc.first;
-					nNode->y2 = mLoc.second;
+					abort(2);
+					return;
 				}
-				else //Deselect object
+				graphNode* parent = colParent(nNode);
+				if (parent == 0)
 				{
-					int i = (*displayItr)->isSelected(sPick);
-					if (i == 1)
-						(*displayItr)->deselect(sPick,0.0,0.0,0.0);
-					else if (i == 2)
-						(*displayItr)->deselectSubtree(sPick,0.0,0.0,0.0);
+					abort(1);
+					return;
 				}
-			}
-			else if (button == GLUT_LEFT_BUTTON) //Left-click
-			{
-				std::pair<float,float> mLoc = getLoc(x,y);
-				graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);
-				if (sPick == (*displayItr)->root)
+				else if (nNode->proxCol(parent,SELBOUND))
 				{
-					nNode = new graphNode();
-					nNode->x1 = mLoc.first;
-					nNode->y1 = mLoc.second;
+					abort(4);
+					return;
 				}
-				else //Already something there, select it
+				else if (insertionMode)
 				{
-					int i = (*displayItr)->isSelected(sPick);
-					if ((mod&GLUT_ACTIVE_CTRL) == GLUT_ACTIVE_CTRL)
+					if (insertInArea(parent) == false || 
+						(insertIsArea(parent) == false && insertIsOld(parent)))
 					{
-						if (i == 1)
+						abort(6);
+						return;
+					}
+					int stealChild = colSteal(nNode,parent);
+					if (stealChild == 2)
+					{
+						abort(3);
+						return;
+					}
+					else if (stealChild == 1)
+					{
+						std::list<graphNode*>::iterator cItr = parent->children.begin();
+						while (cItr != parent->children.end())
 						{
-							(*displayItr)->deselect(sPick,0.0,0.0,0.0);
-							(*displayItr)->selectSubtree(sPick,1.0,0.0,0.0,0.0,0.0,1.0);
+							bool pn1 = nNode->contains((*cItr)->x1,(*cItr)->y1);
+							if (pn1 && insertIsOld(*cItr))
+							{
+								abort(5);
+								return;
+							}
+							cItr++;
 						}
-						else if (i == 0)
-							(*displayItr)->selectSubtree(sPick,1.0,0.0,0.0,0.0,0.0,1.0);
-						alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 3);
-						alterObj.first->subtree = true;
 					}
-					else if ((mod&GLUT_ACTIVE_SHIFT) == GLUT_ACTIVE_SHIFT && sPick->isCut)
-					{
-						alterObj.first->subtree = false;
-						alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 2);
-					}
-					else
-					{
-						if (i == 0)
-							(*displayItr)->select(sPick,1.0,0.0,0.0);
-						alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 1);
-						alterObj.first->subtree = false;
-					}
-					alterObj.first->original = sPick;
 				}
+				
+				if (nNode->stealChildren(parent))
+				{
+					nNode->setColor(0.0,0.0,0.0);
+					(*displayItr)->insert(parent,nNode);
+				}
+				else
+					abort(3);
+				nNode = 0;
 			}
 		}
 		return;
 	}
-	if (state == GLUT_UP) return; //Button release, no selection changes
 
-	if ((mod&GLUT_ACTIVE_CTRL) == GLUT_ACTIVE_CTRL) //Ctrl key is pressed
+	else if (state == GLUT_DOWN && button == GLUT_LEFT_BUTTON)
 	{
-		if (button == GLUT_LEFT_BUTTON) //Left-click
+		std::pair<float,float> mLoc = getLoc(x,y);
+		graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);
+		if (sPick != (*displayItr)->root) //Clicked on something
 		{
-			//Select subtree
-			std::pair<float,float> mLoc = getLoc(x,y);
-			graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);
-			if (sPick != (*displayItr)->root)
+			int i = (*displayItr)->isSelected(sPick);
+			if ((mod&GLUT_ACTIVE_CTRL) == GLUT_ACTIVE_CTRL)
 			{
-				int i = (*displayItr)->isSelected(sPick);
 				if (i == 1)
 				{
 					(*displayItr)->deselect(sPick,0.0,0.0,0.0);
@@ -945,57 +816,57 @@ void Mouse(int button, int state, int x, int y)
 				}
 				else if (i == 0)
 					(*displayItr)->selectSubtree(sPick,1.0,0.0,0.0,0.0,0.0,1.0);
-				alterObj.first->original = sPick;
 				alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 3);
 				alterObj.first->subtree = true;
 			}
-		}
-	}
-	else
-	{
-		if (button == GLUT_LEFT_BUTTON) //Left-click
-		{
-			//Select object
-			std::pair<float,float> mLoc = getLoc(x,y);
-			graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);
-			if (sPick != (*displayItr)->root)
+			else if ((mod&GLUT_ACTIVE_SHIFT) == GLUT_ACTIVE_SHIFT && sPick->isCut)
 			{
-				int i = (*displayItr)->isSelected(sPick);
+				alterObj.first->subtree = false;
+				alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 2);
+			}
+			else
+			{
 				if (i == 0)
 					(*displayItr)->select(sPick,1.0,0.0,0.0);
-				alterObj.first->original = sPick;
-				if ((mod&GLUT_ACTIVE_SHIFT) == GLUT_ACTIVE_SHIFT && sPick->isCut)
-					alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 2);
-				else
-					alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 1);
+				alterObj.first->set(mLoc.first, mLoc.second, sPick->x1, sPick->y1, sPick->x2, sPick->y2, 1);
 				alterObj.first->subtree = false;
-				if (i == 2)
-					alterObj.first->subtree = true;
 			}
+			alterObj.first->original = sPick;
+			alterObj.second = 0; //Reset object for alteration, just in case.
 		}
-		else if (button == GLUT_RIGHT_BUTTON) //Right-click
+		else if (premiseMode)
 		{
-			//Deselect object
-			std::pair<float,float> mLoc = getLoc(x,y);
-			graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);
-			if (sPick != (*displayItr)->root)
-			{
-				int i = (*displayItr)->isSelected(sPick);
-				if (i == 1)
-					(*displayItr)->deselect(sPick,0.0,0.0,0.0);
-				else if (i == 2)
-					(*displayItr)->deselectSubtree(sPick,0.0,0.0,0.0);
-			}
-			else //Make a new doublecut
-			{
-				nNode = new graphNode();
-				nNode->isCut = true;
-				nNode->setColor(0.5,0.5,0.5);
-				nNode->x1 = mLoc.first;
-				nNode->y1 = mLoc.second;
-				nNode->x2 = mLoc.first;
-				nNode->y2 = mLoc.second;
+			nNode = new graphNode();
+			nNode->x1 = mLoc.first;
+			nNode->y1 = mLoc.second;
+		}
+		return;
+	}
 
+	else if (state == GLUT_DOWN && button == GLUT_RIGHT_BUTTON)
+	{
+		std::pair<float,float> mLoc = getLoc(x,y);
+		graphNode* sPick = (*displayItr)->getObject(mLoc.first, mLoc.second);
+		if (sPick != (*displayItr)->root) //Clicked on something
+		{
+			int i = (*displayItr)->isSelected(sPick);
+			if (i == 1)
+				(*displayItr)->deselect(sPick,0.0,0.0,0.0);
+			else if (i == 2)
+				(*displayItr)->deselectSubtree(sPick,0.0,0.0,0.0);
+		}
+		else
+		{
+			nNode = new graphNode();
+			nNode->isCut = true;
+			nNode->setColor(0.5,0.5,0.5);
+			nNode->x1 = mLoc.first;
+			nNode->y1 = mLoc.second;
+			nNode->x2 = mLoc.first;
+			nNode->y2 = mLoc.second;
+
+			if (premiseMode == false)
+			{
 				graphNode* nn2 = new graphNode();
 				nn2->isCut = true;
 				nn2->setColor(0.5,0.5,0.5);
@@ -1007,6 +878,7 @@ void Mouse(int button, int state, int x, int y)
 				nNode->addChild(nn2);
 			}
 		}
+		return;
 	}
 }
 
@@ -1110,6 +982,19 @@ void MouseActMove(int x, int y)
 //Mouse is moving while no button is pressed
 void MousePassMove(int x, int y)
 {
+	//Scroll the screen if you get close to the edges
+	if (x < (float)screenWidth/10 && x >= 0)
+		cameraVX = -0.2;
+	else if (x > (float)screenWidth*9/10 && x <= screenWidth)
+		cameraVX = 0.2;
+	else
+		cameraVX = 0.0;
+	if (y < (float)screenHeight/10 && y >= 0)
+		cameraVY = 0.2;
+	else if (y > (float)screenHeight*9/10 && y <= screenWidth)
+		cameraVY = -0.2;
+	else
+		cameraVY = 0.0;
 }
 
 //Get the location of the mouse in the drawing plane
@@ -1127,8 +1012,27 @@ std::pair<float,float> getLoc(int mx, int my)
 	return loc;
 }
 
+/*std::pair<float,float> getLoc(int mx, int my)
+{
+	float h = tan((float)45/2);
+	float w = h*(float)screenWidth/(float)screenHeight;
+
+	float dH = (h - my)/(float)h;
+	float dW = (w - mx)/(float)w;
+
+	float y = cameraY + cameraZ*dH;
+	float x = cameraX - cameraZ*dW;
+
+	std::pair<float,float> loc;
+	loc.first = x;
+	loc.second = y;
+	return loc;
+}
+*/
 void animate(int value)
 {
+	cameraX+= cameraVX;
+	cameraY+= cameraVY;
 	glutSetWindow(tooltipWindow);
 	glutPostRedisplay();
 	glutSetWindow(mainWindow);
@@ -1160,6 +1064,8 @@ void reset()
 	displayItr = undoBuffer.begin();
 
 	premiseMode = true;
+	takeInTxt = false;
+	insertionMode = false;
 	cameraX = 0;
 	cameraY = 0;
 	cameraZ = 15;
@@ -1325,347 +1231,34 @@ bool verifyStep(std::string rule)
 			itr++;
 		}
 	}
+	else if (rule.compare("Insertion") == 0)
+	{
+		//Determine if everything selected is a cut at an even level.
+		while (itr != (*displayItr)->selection.end())
+		{
+			if ((*itr).first->isCut == false)
+			{
+				ttip.setText("At least one selected object is not a cut.");
+				ttip.setColor(1.0,0.0,0.0);
+				verify = false;
+				break;
+			}
+			if ((*itr).first->getDepth() % 2 == 1)
+			{
+				ttip.setText("At least one selected area is not an odd level.");
+				ttip.setColor(1.0,0.0,0.0);
+				verify = false;
+				break;
+			}
+			itr++;
+		}
+	}
 	else if (rule.compare("Iteration") == 0)
-	{
-		graphNode* obj = alterObj.second;
-		selectObj* sObj = alterObj.first;
-		if (obj->isCut)
-		{
-			//Boundary checking
-			graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
-			graphNode* p2 = (*displayItr)->getLowestSubtree(obj->x2,obj->y2);
-			graphNode* p3 = (*displayItr)->getLowestSubtree(obj->x1,obj->y2);
-			graphNode* p4 = (*displayItr)->getLowestSubtree(obj->x2,obj->y1);
-			if (p1 != p2 || p1 != p3 || p1 != p4)
-			{
-				ttip.setText("Not contained entirely by one subtree.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-			else if (obj->proxCol(p1,SELBOUND))
-			{
-				//Too close to something else. Fail.
-				ttip.setText("Cut or contained object is too close to another object.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-			std::list<graphNode*>::iterator cItr = obj->children.begin();
-			while (verify && cItr != obj->children.end())
-			{
-				if ((*cItr)->isCut)
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					bool pn2 = obj->contains((*cItr)->x2,(*cItr)->y2);
-					bool pn3 = obj->contains((*cItr)->x1,(*cItr)->y2);
-					bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
-					if (pn1 != pn2 || pn1 != pn3 || pn1 != pn4)
-					{
-						ttip.setText("A child would be partially contained by different subtrees.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-					else if (!pn1)
-					{
-						ttip.setText("All children must remain inside this cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				else
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					if (!pn1)
-					{
-						ttip.setText("All children must remain inside this cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				cItr++;
-			}
-			if (verify && p1 != obj->parent)
-			{
-				//Object has a new parent. Check for validity.
-				if (!(p1->inSubtree(obj->parent)))
-				{
-					ttip.setText("Object can only be iterated to a lower level in the same subtree.");
-					ttip.setColor(1.0,0.0,0.0);
-					verify = false;
-				}
-			}
-			//Check if it now contains new objects.
-			cItr = p1->children.begin(); //Current parent is p1 whether it was before or not.
-			while (verify && cItr != p1->children.end())
-			{
-				if ((*cItr) == obj)
-				{
-					cItr++;
-					continue;
-				}
-				if ((*cItr)->isCut)
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					bool pn2 = obj->contains((*cItr)->x1,(*cItr)->y2);
-					bool pn3 = obj->contains((*cItr)->x2,(*cItr)->y2);
-					bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
-					if (pn1 && pn2 && pn3 && pn4)
-					{
-						ttip.setText("Cut cannot steal existing children.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-					else if (pn1 || pn2 || pn3 || pn4)
-					{
-						ttip.setText("Cut would partially contain another cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				else
-				{
-					if(obj->contains((*cItr)->x1,(*cItr)->y1))
-					{
-						ttip.setText("Cut cannot steal existing children.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				cItr++;
-			}
-		}
-		else
-		{
-			graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
-			if (obj->proxCol(p1,SELBOUND))
-			{
-				//Too close to something else. Fail.
-				ttip.setText("Object is too close to another object.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-			else if (p1 != obj->parent) //New parent
-			{
-				if (!(p1->inSubtree(obj->parent)))
-				{
-					ttip.setText("Object can only be iterated to a lower level in the same subtree.");
-					ttip.setColor(1.0,0.0,0.0);
-					verify = false;
-				}
-			}
-		}
-	}
+		verify = verifyIteration();
 	else if (rule.compare("InsertionC") == 0)
-	{
-		//Special case of Insertion where the object to be
-		//added already exists and is being moved or copied
-		//to the location rather than drawn.
-		graphNode* obj = alterObj.second;
-		selectObj* sObj = alterObj.first;
-		if (obj->isCut)
-		{
-			//Boundary checking
-			graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
-			graphNode* p2 = (*displayItr)->getLowestSubtree(obj->x2,obj->y2);
-			graphNode* p3 = (*displayItr)->getLowestSubtree(obj->x1,obj->y2);
-			graphNode* p4 = (*displayItr)->getLowestSubtree(obj->x2,obj->y1);
-			if (p1 != p2 || p1 != p3 || p1 != p4)
-			{
-				ttip.setText("Not contained entirely by one subtree.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-			else if (obj->proxCol(p1,SELBOUND))
-			{
-				//Too close to something else. Fail.
-				ttip.setText("Cut or contained object is too close to another object.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-			std::list<graphNode*>::iterator cItr = obj->children.begin();
-			bool loseChildren = false;
-			while (verify && cItr != obj->children.end())
-			{
-				if ((*cItr)->isCut)
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					bool pn2 = obj->contains((*cItr)->x2,(*cItr)->y2);
-					bool pn3 = obj->contains((*cItr)->x1,(*cItr)->y2);
-					bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
-					if (pn1 != pn2 || pn1 != pn3 || pn1 != pn4)
-					{
-						ttip.setText("A child would be partially contained by different subtrees.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-					else if (!pn1)
-						loseChildren = true;
-				}
-				else
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					if (!pn1)
-						loseChildren = true;
-				}
-				cItr++;
-			}
-			if (verify)
-			{
-				//Check for validity.
-				if (p1->getDepth() % 2 != 0)
-				{
-					ttip.setText("Object can only be Inserted at an odd level.");
-					ttip.setColor(1.0,0.0,0.0);
-					verify = false;
-				}
-			}
-			//Check if it now contains new objects.
-			cItr = p1->children.begin(); //Current parent is p1 whether it was before or not.
-			while (verify && cItr != p1->children.end())
-			{
-				if ((*cItr) == obj)
-				{
-					cItr++;
-					continue;
-				}
-				if ((*cItr)->isCut)
-				{
-					bool pn1 = obj->contains((*cItr)->x1,(*cItr)->y1);
-					bool pn2 = obj->contains((*cItr)->x1,(*cItr)->y2);
-					bool pn3 = obj->contains((*cItr)->x2,(*cItr)->y2);
-					bool pn4 = obj->contains((*cItr)->x2,(*cItr)->y1);
-					if (pn1 && pn2 && pn3 && pn4)
-					{
-						ttip.setText("Cut cannot steal existing children.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-					else if (pn1 || pn2 || pn3 || pn4)
-					{
-						ttip.setText("Cut would partially contain another cut.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				else
-				{
-					if(obj->contains((*cItr)->x1,(*cItr)->y1))
-					{
-						ttip.setText("Cut cannot steal existing children.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				cItr++;
-			}
-		}
-		else
-		{
-			graphNode* p1 = (*displayItr)->getLowestSubtree(obj->x1,obj->y1);
-			if (obj->proxCol(p1,SELBOUND))
-			{
-				//Too close to something else. Fail.
-				ttip.setText("Object is too close to another object.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-			else if (p1->getDepth() % 2 != 0)
-			{
-				ttip.setText("Object can only be Inserted at an odd level.");
-				ttip.setColor(1.0,0.0,0.0);
-				verify = false;
-			}
-		}
-	}
+		verify = verifyInsertionC();
 	else if (rule.compare("DoubleCutAdd") == 0)
-	{
-		graphNode* nn2 = nNode->children.front();
-		if (abs(nn2->x1 - nn2->x2) < SELBOUND*4 || abs(nn2->y1 - nn2->y2) < SELBOUND*4)
-		{
-			ttip.setText("Cut is too small.");
-			ttip.setColor(1.0,0.0,0.0);
-			verify = false;
-		}
-		//Boundary checking
-		graphNode* p1 = (*displayItr)->getLowestSubtree(nNode->x1,nNode->y1);
-		graphNode* p2 = (*displayItr)->getLowestSubtree(nNode->x2,nNode->y2);
-		graphNode* p3 = (*displayItr)->getLowestSubtree(nNode->x1,nNode->y2);
-		graphNode* p4 = (*displayItr)->getLowestSubtree(nNode->x2,nNode->y1);
-
-		if (p1 != p2 || p1 != p3 || p1 != p4)
-		{
-			ttip.setText("Cut is not contained entirely by one subtree.");
-			ttip.setColor(1.0,0.0,0.0);
-			verify = false;
-		}
-		else
-		{
-			//Check for children that would need to be stolen.
-			std::list<graphNode*>::iterator cItr = p1->children.begin();
-			while (cItr != p1->children.end())
-			{
-				if ((*cItr)->isCut)
-				{
-					int corners = 0;
-					if (nn2->contains((*cItr)->x1,(*cItr)->y1))
-						corners++;
-					if (nn2->contains((*cItr)->x2,(*cItr)->y2))
-						corners++;
-					if (nn2->contains((*cItr)->x1,(*cItr)->y2))
-						corners++;
-					if (nn2->contains((*cItr)->x2,(*cItr)->y1))
-						corners++;
-					if (corners != 4 && corners > 0)
-					{
-						ttip.setText("Cut partially contains another object.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-					else if (corners != 4)
-					{
-						//Make sure that the outer cut doesn't contain it.
-						if (nNode->contains((*cItr)->x1,(*cItr)->y1))
-							corners++;
-						if (nNode->contains((*cItr)->x2,(*cItr)->y2))
-							corners++;
-						if (nNode->contains((*cItr)->x1,(*cItr)->y2))
-							corners++;
-						if (nNode->contains((*cItr)->x2,(*cItr)->y1))
-							corners++;
-						if (corners > 0)
-						{
-							ttip.setText("Object is between the cuts.");
-							ttip.setColor(1.0,0.0,0.0);
-							verify = false;
-							break;
-						}
-					}
-				}
-				else
-				{
-					if (!(nn2->contains((*cItr)->x1,(*cItr)->y1)) && 
-						nNode->contains((*cItr)->x1,(*cItr)->y1))
-					{
-						ttip.setText("Object is between the cuts.");
-						ttip.setColor(1.0,0.0,0.0);
-						verify = false;
-						break;
-					}
-				}
-				cItr++;
-			}
-		}
-	}
+		verify = verifyDCutAdd();
 	else
 	{
 		ttip.setText("Unknown inference rule");
@@ -1674,6 +1267,192 @@ bool verifyStep(std::string rule)
 	glutSetWindow(tooltipWindow);
 	glutPostRedisplay();
 	return verify;
+}
+
+bool verifyIteration()
+{
+	graphNode* obj = alterObj.second;
+	selectObj* sObj = alterObj.first;
+	//Boundary checking
+	graphNode* p1 = colParent(obj);
+	if (p1 == 0)
+	{
+		ttip.setText("Not contained entirely by one subtree.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	else if (obj->proxCol(p1,SELBOUND))
+	{
+		//Too close to something else. Fail.
+		ttip.setText("Object or child is too close to another object.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	if (p1 != obj->parent)
+	{
+		//Object has a new parent. Check for validity.
+		if (!(p1->inSubtree(obj->parent)))
+		{
+			ttip.setText("Object can only be iterated to a lower level in the same subtree.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+	}
+	if (obj->isCut)
+	{
+		int colChild = colChildren(obj);
+		if (colChild == 2)
+		{
+			ttip.setText("A child would be partially contained by different subtrees.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+		else if (colChild == 1)
+		{
+			ttip.setText("All children must remain inside this cut.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+		//Check if it now contains new objects.
+		int stealChild = colSteal(obj, p1);
+		if (stealChild == 2)
+		{
+			ttip.setText("Cut would partially contain another cut.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+		else if (stealChild == 1)
+		{
+			ttip.setText("Cut cannot steal existing children.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+	}
+	return true;
+}
+
+bool verifyInsertionC()
+{
+	//Special case of Insertion where the object to be
+	//added already exists and is being moved or copied
+	//to the location rather than drawn.
+	graphNode* obj = alterObj.second;
+	selectObj* sObj = alterObj.first;
+	graphNode* p1 = colParent(obj);
+	if (p1 == 0)
+	{
+		ttip.setText("Not contained entirely by one subtree.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	else if (p1->getDepth() % 2 != 0)
+	{
+		ttip.setText("Object can only be Inserted at an odd level.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	else if (obj->proxCol(p1,SELBOUND))
+	{
+		//Too close to something else. Fail.
+		ttip.setText("Object or child is too close to another object.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	if (obj->isCut)
+	{
+		int colChild = colChildren(obj);
+		if (colChild == 2)
+		{
+			ttip.setText("A child would be partially contained by different subtrees.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+		//Check if it now contains new objects.
+		int stealChild = colSteal(obj, p1);
+		if (stealChild == 2)
+		{
+			ttip.setText("Cut would partially contain another object.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+		else if (stealChild == 1)
+		{
+			ttip.setText("Cut cannot steal existing children.");
+			ttip.setColor(1.0,0.0,0.0);
+			return false;
+		}
+	}
+	return true;
+}
+bool verifyDCutAdd()
+{
+	graphNode* nn2 = nNode->children.front();
+	if (abs(nn2->x1 - nn2->x2) < SELBOUND*4 || abs(nn2->y1 - nn2->y2) < SELBOUND*4)
+	{
+		ttip.setText("Cut is too small.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	graphNode* p1 = colParent(nNode);
+	if (p1 == 0)
+	{
+		ttip.setText("Cut is not contained entirely by one subtree.");
+		ttip.setColor(1.0,0.0,0.0);
+		return false;
+	}
+	//Check for children that would need to be stolen.
+	std::list<graphNode*>::iterator cItr = p1->children.begin();
+	while (cItr != p1->children.end())
+	{
+		if ((*cItr)->isCut)
+		{
+			int corners = 0;
+			if (nn2->contains((*cItr)->x1,(*cItr)->y1))
+				corners++;
+			if (nn2->contains((*cItr)->x2,(*cItr)->y2))
+				corners++;
+			if (nn2->contains((*cItr)->x1,(*cItr)->y2))
+				corners++;
+			if (nn2->contains((*cItr)->x2,(*cItr)->y1))
+				corners++;
+			if (corners != 4 && corners > 0)
+			{
+				ttip.setText("Cut partially contains another object.");
+				ttip.setColor(1.0,0.0,0.0);
+				return false;
+			}
+			else if (corners != 4)
+			{
+				//Make sure that the outer cut doesn't contain it.
+				if (nNode->contains((*cItr)->x1,(*cItr)->y1))
+					corners++;
+				if (nNode->contains((*cItr)->x2,(*cItr)->y2))
+					corners++;
+				if (nNode->contains((*cItr)->x1,(*cItr)->y2))
+					corners++;
+				if (nNode->contains((*cItr)->x2,(*cItr)->y1))
+					corners++;
+				if (corners > 0)
+				{
+					ttip.setText("Object is between the cuts.");
+					ttip.setColor(1.0,0.0,0.0);
+					return false;
+				}
+			}
+		}
+		else
+		{
+			if (!(nn2->contains((*cItr)->x1,(*cItr)->y1)) && 
+				nNode->contains((*cItr)->x1,(*cItr)->y1))
+			{
+				ttip.setText("Object is between the cuts.");
+				ttip.setColor(1.0,0.0,0.0);
+				return false;
+			}
+		}
+		cItr++;
+	}
+	return true;
 }
 
 bool verifyRec(std::string rule, std::list<graphNode*> used, std::list<std::pair<graphNode*,bool> >::iterator itr)
@@ -1838,6 +1617,28 @@ void applyStep(std::string rule)
 		ttip.setText("Iteration successful.");
 		ttip.setColor(0.0,1.0,0.0);
 	}
+	else if (rule.compare("Insertion") == 0)
+	{
+		std::list<std::pair<graphNode*,bool> >::iterator itr = (*displayItr)->selection.begin();
+		std::list<graphNode*>::iterator cItr;
+		while (itr != (*displayItr)->selection.end())
+		{
+			insertionCuts.push_back((*itr).first);
+			cItr = (*itr).first->children.begin();
+			while (cItr != (*itr).first->children.end())
+			{
+				insertionChildren.push_back(*cItr);
+				cItr++;
+			}
+			itr++;
+		}
+		insertionMode = true;
+		premiseMode = true;
+		ttip.setText("Insertion Mode.");
+		ttip.setColor(0.3,0.7,0.9);
+		glutSetWindow(tooltipWindow);
+		glutPostRedisplay();
+	}
 	else if (rule.compare("InsertionC") == 0)
 	{
 		if (alterObj.first->type == 3) //Copy operation
@@ -1896,6 +1697,41 @@ void applyStep(std::string rule)
 	glutPostRedisplay();
 }
 
+bool insertInArea(graphNode* obj)
+{
+	std::list<graphNode*>::iterator itr = insertionCuts.begin();
+	while (itr != insertionCuts.end())
+	{
+		if (obj->inSubtree(*itr) || obj == *itr)
+			return true;
+		itr++;
+	}
+	return false;
+}
+bool insertIsArea(graphNode* obj)
+{
+	std::list<graphNode*>::iterator itr = insertionCuts.begin();
+	while (itr != insertionCuts.end())
+	{
+		if (obj == *itr)
+			return true;
+		itr++;
+	}
+	return false;
+}
+bool insertIsOld(graphNode* obj)
+{
+	if (insertIsArea(obj))
+		return true;
+	std::list<graphNode*>::iterator itr = insertionChildren.begin();
+	while (itr != insertionChildren.end())
+	{
+		if (obj == *itr || obj->inSubtree(*itr))
+			return true;
+		itr++;
+	}
+	return false;
+}
 bool contains(std::list<graphNode*> lst, graphNode* obj)
 {
 	std::list<graphNode*>::iterator itr = lst.begin();

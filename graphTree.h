@@ -27,7 +27,8 @@ public:
 
 	void moveAll(float x, float y);
 	void move(float x, float y);
-	bool proxCol(graphNode* parent, float SELBOUND);
+	bool proxCol(graphNode* parent, float bound);
+	bool proxCol2(graphNode* node, float bound);
 	graphNode* duplicates(graphNode* obj);
 
 	int getDepth();
@@ -430,50 +431,13 @@ void graphNode::move(float x, float y)
 }
 //Checks if there is a "collision" -- ie, this object is
 //too close to another child of the specified parent.
-//It will also check to see if any of its children (and
-//its children's children, etc.) collide.
 bool graphNode::proxCol(graphNode* parent, float bound)
 {
-	return false;
 	//Check for collisions against the parent, if parent isn't the root.
 	if (parent->isCut)
 	{
-		if (this->isCut)
-		{
-			if (abs(parent->x1 - x1) < bound || abs(parent->x2 - x1) < bound ||
-				abs(parent->x1 - x2) < bound || abs(parent->x2 - x2) < bound)
-			{
-				if (!( (parent->y1+bound < y1 && parent->y1+bound < y2 &&
-						parent->y2+bound < y1 && parent->y2+bound < y2) ||
-						(parent->y1-bound > y1 && parent->y1-bound > y2 &&
-						parent->y2-bound > y1 && parent->y2-bound > y2)))
-					return true;
-			}
-			else if (abs(parent->y1 - y1) < bound || abs(parent->y2 - y1) < bound ||
-				abs(parent->y1 - y2) < bound || abs(parent->y2 - y2) < bound)
-			{
-				if (!( (parent->x1+bound < x1 && parent->x1+bound < x2 &&
-						parent->x2+bound < x1 && parent->x2+bound < x2) ||
-						(parent->x1-bound > x1 && parent->x1-bound > x2 &&
-						parent->x2-bound > x1 && parent->x2-bound > x2)))
-					return true;
-			}
-		}
-		else
-		{
-			if (abs(parent->x1 - x1) < bound || abs(parent->x2 - x1) < bound)
-			{
-				if ((parent->y1+bound < y1 && parent->y2-bound > y1) ||
-					(parent->y2+bound < y1 && parent->y1-bound > y1))
-					return true;
-			}
-			else if (abs(parent->y1 - y1) < bound || abs(parent->y2 - y1) < bound)
-			{
-				if ((parent->x1+bound < x1 && parent->x2-bound > x1) ||
-					(parent->x2+bound < x1 && parent->x1-bound > x1))
-					return true;
-			}
-		}
+		if(this->proxCol2(parent,bound))
+			return true;
 	}
 	std::list<graphNode*>::iterator itr = parent->children.begin();
 	while (itr != parent->children.end())
@@ -483,76 +447,80 @@ bool graphNode::proxCol(graphNode* parent, float bound)
 			itr++;
 			continue;
 		}
-		if ((*itr)->isCut)
+		if (this->proxCol2((*itr),bound))
+			return true;
+		itr++;
+	}
+	return false;
+}
+
+//Determines if this collides with the given object.
+bool graphNode::proxCol2(graphNode* node, float bound)
+{
+	if (node->isCut)
+	{
+		if (this->isCut)
 		{
-			if (this->isCut)
+			bool pn1 = this->contains(node->x1,node->y1);
+			bool pn2 = this->contains(node->x2,node->y2);
+			bool pn3 = this->contains(node->x1,node->y2);
+			bool pn4 = this->contains(node->x2,node->y1);
+			if (pn1 != pn2 || pn1 != pn3 || pn1 != pn4)
+				return true;
+
+			if ((x1-bound <= node->x1 && node->x1 <= x2+bound) ||
+				(x1+bound >= node->x1 && node->x1 >= x2-bound))
 			{
-				if (abs((*itr)->x1 - x1) < bound || abs((*itr)->x2 - x1) < bound ||
-					abs((*itr)->x1 - x2) < bound || abs((*itr)->x2 - x2) < bound)
-				{
-					if (!( ((*itr)->y1+bound < y1 && (*itr)->y1+bound < y2 &&
-							(*itr)->y2+bound < y1 && (*itr)->y2+bound < y2) ||
-							((*itr)->y1-bound > y1 && (*itr)->y1-bound > y2 &&
-							(*itr)->y2-bound > y1 && (*itr)->y2-bound > y2)))
-						return true;
-				}
-				else if (abs((*itr)->y1 - y1) < bound || abs((*itr)->y2 - y1) < bound ||
-					abs((*itr)->y1 - y2) < bound || abs((*itr)->y2 - y2) < bound)
-				{
-					if (!( ((*itr)->x1+bound < x1 && (*itr)->x1+bound < x2 &&
-							(*itr)->x2+bound < x1 && (*itr)->x2+bound < x2) ||
-							((*itr)->x1-bound > x1 && (*itr)->x1-bound > x2 &&
-							(*itr)->x2-bound > x1 && (*itr)->x2-bound > x2)))
-						return true;
-				}
+				if ((node->y1 - bound <= y1 && y1 <= node->y2 + bound) ||
+					(node->y1 + bound >= y1 && y1 >= node->y2 - bound))
+					return true;
 			}
-			else
+			else if ((y1-bound <= node->y1 && node->y1 <= y2+bound) ||
+					 (y1+bound >= node->y1 && node->y1 >= y2-bound))
 			{
-				if (abs((*itr)->x1 - x1) < bound || abs((*itr)->x2 - x1) < bound)
-				{
-					if (((*itr)->y1+bound < y1 && (*itr)->y2-bound > y1) ||
-						((*itr)->y2+bound < y1 && (*itr)->y1-bound > y1))
-						return true;
-				}
-				else if (abs((*itr)->y1 - y1) < bound || abs((*itr)->y2 - y1) < bound)
-				{
-					if (((*itr)->x1+bound < x1 && (*itr)->x2-bound > x1) ||
-						((*itr)->x2+bound < x1 && (*itr)->x1-bound > x1))
-						return true;
-				}
+				if ((node->x1 - bound <= x1 && x1 <= node->x2 + bound) ||
+					(node->x1 + bound >= x1 && x1 >= node->x2 - bound))
+					return true;
 			}
 		}
 		else
 		{
-			if (this->isCut)
+			if (abs(node->x1 - x1) <= bound || abs(node->x2 - x1) <= bound)
 			{
-				if (abs((*itr)->x1 - x1) < bound || abs((*itr)->x1 - x2) < bound)
-				{
-					if (((*itr)->y1 < y1-bound && (*itr)->y1 > y2+bound) ||
-						((*itr)->y1 < y2-bound && (*itr)->y1 > y1+bound))
-						return true;
-				}
-				else if (abs((*itr)->y1 - y1) < bound || abs((*itr)->y1 - y2) < bound)
-				{
-					if (((*itr)->x1 < x1-bound && (*itr)->x1 > x2+bound) ||
-						((*itr)->x1 < x2-bound && (*itr)->x1 > x1+bound))
-						return true;
-				}
+				if ((node->y1-bound <= y1 && node->y2+bound >= y1) ||
+					(node->y2-bound <= y1 && node->y1+bound >= y1))
+					return true;
 			}
-			else
+			else if (abs(node->y1 - y1) <= bound || abs(node->y2 - y1) <= bound)
 			{
-				if (abs((*itr)->x1 - x1) < bound || abs((*itr)->y1 - y1) < bound)
+				if ((node->x1-bound <= x1 && node->x2+bound >= x1) ||
+					(node->x2-bound <= x1 && node->x1+bound >= x1))
 					return true;
 			}
 		}
-		itr++;
 	}
-	itr = this->children.begin();
-	while (itr != this->children.end())
+	else
 	{
-		if ((*itr)->proxCol(parent,bound))
-			return true;
-		itr++;
+		if (this->isCut)
+		{
+			if (abs(node->x1 - x1) <= bound || abs(node->x1 - x2) <= bound)
+			{
+				if ((node->y1 <= y1+bound && node->y1 >= y2-bound) ||
+					(node->y1 <= y2+bound && node->y1 >= y1-bound))
+					return true;
+			}
+			else if (abs(node->y1 - y1) <= bound || abs(node->y1 - y2) <= bound)
+			{
+				if ((node->x1 <= x1+bound && node->x1 >= x2-bound) ||
+					(node->x1 <= x2+bound && node->x1 >= x1-bound))
+					return true;
+			}
+		}
+		else
+		{
+			if (abs(node->x1 - x1) <= bound && abs(node->y1 - y1) <= bound)
+				return true;
+		}
 	}
 	return false;
 }
